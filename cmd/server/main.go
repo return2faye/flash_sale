@@ -5,6 +5,7 @@ import (
 	"log"
 
 	"flash_sale/internal/model"
+	"flash_sale/internal/queue"
 	"flash_sale/internal/router"
 
 	"github.com/gin-gonic/gin"
@@ -24,17 +25,27 @@ func main() {
 	}
 
 	rdb := rd.NewClient(&rd.Options{
-		Addr: "localhost:6379",
+		Addr:     "localhost:6379",
 		Password: "",
-		DB: 0,
+		DB:       0,
 	})
 
 	if err := rdb.Ping(context.Background()).Err(); err != nil {
 		log.Fatalf("redis: %v（请先启动 Redis，如 docker run -d -p 6379:6379 redis:alpine）", err)
 	}
 
+	brokers := []string{"localhost:9092"}
+	topic := "flash-sale-orders"
+
+	producer := queue.NewProducer(brokers, topic)
+	defer producer.Close()
+
+	consumer := queue.NewConsumer(brokers, topic, "flash-sale-order-consumer", db)
+	go consumer.Run(context.Background())
+	defer consumer.Close()
+
 	r := gin.Default()
-	router.Setup(r, db, rdb)
+	router.Setup(r, db, rdb, producer)
 
 	r.Run(":8080")
 }

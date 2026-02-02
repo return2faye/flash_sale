@@ -19,6 +19,7 @@ type Order struct {
 	Quantity  int   `gorm:"not null;default:1" json:"quantity"`
 	Amount    int64 `gorm:"not null" json:"amount"` // 总金额，单位分
 	Status    int   `gorm:"not null;default:0" json:"status"` // 0 待支付 1 已支付 2 已取消
+	RequestID string `gorm:"size:64;uniqueIndex;not null" json:"request_id"`
 }
 
 // 显式实现结构，确定表名

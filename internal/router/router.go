@@ -2,13 +2,14 @@ package router
 
 import (
 	"errors"
-	"flash_sale/internal/middleware"
-	"flash_sale/internal/model"
-	"flash_sale/pkg/redis"
-	"fmt"
 	"net/http"
 	"strconv"
 	"time"
+
+	"flash_sale/internal/middleware"
+	"flash_sale/internal/model"
+	"flash_sale/internal/queue"
+	"flash_sale/pkg/redis"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -29,7 +30,7 @@ else
 end
 `
 
-func Setup(r *gin.Engine, db *gorm.DB, rdb *rd.Client) {
+func Setup(r *gin.Engine, db *gorm.DB, rdb *rd.Client, producer *queue.Producer) {
 	r.GET("/ping", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"msg": "pong"})
 	})
@@ -39,7 +40,8 @@ func Setup(r *gin.Engine, db *gorm.DB, rdb *rd.Client) {
 	// flash Sale
 	r.POST("/api/flash_sale/preload/:product_id", preloadStock(db, rdb))
 	r.GET("/api/flash_sale/stock/:product_id", getStock(rdb))
-	r.POST("/api/flash_sale/buy", middleware.RedisRateLimit(rdb, 1000, time.Second), secKill(db, rdb))
+	r.POST("/api/flash_sale/buy", middleware.RedisRateLimit(rdb, 1000, time.Second), secKill(db, rdb, producer))
+	r.GET("/api/flash_sale/result/:request_id", getResult(db))
 }
 
 func listProducts(db *gorm.DB) gin.HandlerFunc {
@@ -110,7 +112,7 @@ func preloadStock(db *gorm.DB, rdb *rd.Client) gin.HandlerFunc {
 			return
 		}
 		key := redis.StockKey(uint(id))
-		if err := rdb.Set(c.Request.Context(), key, p.Stock,24*time.Hour).Err(); err != nil {
+		if err := rdb.Set(c.Request.Context(), key, p.Stock, 24*time.Hour).Err(); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "msg": err.Error()})
 			return
 		}
@@ -141,10 +143,10 @@ func getStock(rdb *rd.Client) gin.HandlerFunc {
 	}
 }
 
-func secKill(db *gorm.DB, rdb *rd.Client) gin.HandlerFunc {
+func secKill(db *gorm.DB, rdb *rd.Client, producer *queue.Producer) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req struct {
-			ProductID uint `json:"product_id" binding:"required"`
+			ProductID uint  `json:"product_id" binding:"required"`
 			UserID    int64 `json:"user_id" binding:"required"`
 			Quantity  int   `json:"quantity"`
 		}
@@ -158,8 +160,8 @@ func secKill(db *gorm.DB, rdb *rd.Client) gin.HandlerFunc {
 			req.Quantity = 1
 		}
 
-		var p model.Product
-		if err := db.First(&p, req.ProductID).Error; err != nil {
+		var prod model.Product
+		if err := db.First(&prod, req.ProductID).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				c.JSON(http.StatusNotFound, gin.H{"code": 404, "msg": "商品不存在"})
 				return
@@ -169,7 +171,7 @@ func secKill(db *gorm.DB, rdb *rd.Client) gin.HandlerFunc {
 		}
 
 		now := time.Now()
-		if now.Before(p.StartTime) || now.After(p.EndTime) {
+		if now.Before(prod.StartTime) || now.After(prod.EndTime) {
 			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "msg": "不在秒杀时间段内"})
 			return
 		}
@@ -198,25 +200,61 @@ func secKill(db *gorm.DB, rdb *rd.Client) gin.HandlerFunc {
 			return
 		}
 
-		// 4. 生成订单号并写 DB
-		orderNo := fmt.Sprintf("SK%d%s", time.Now().Unix(), uuid.New().String()[:8])
-		amount := p.SalePrice * int64(req.Quantity)
-		order := &model.Order{
-			OrderNo:   orderNo,
-			UserID:    req.UserID,
+		// 4. 生成请求 ID，投递 Kafka，由后台异步写订单
+		requestID := uuid.New().String()
+		amount := prod.SalePrice * int64(req.Quantity)
+
+		msg := queue.OrderMessage{
+			RequestID: requestID,
 			ProductID: req.ProductID,
+			UserID:    req.UserID,
 			Quantity:  req.Quantity,
 			Amount:    amount,
-			Status:    0,
 		}
-		if err := db.Create(order).Error; err != nil {
-			// 写 DB 失败：回滚 Redis 库存
-			rdb.IncrBy(c.Request.Context(), key, int64(req.Quantity))
+
+		if err := producer.Publish(c.Request.Context(), msg); err != nil {
+			// 投递失败：回滚 Redis 库存
+			_ = rdb.IncrBy(c.Request.Context(), key, int64(req.Quantity)).Err()
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "msg": "enqueue failed: " + err.Error()})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"request_id": requestID}})
+
+	}
+}
+
+// getResult 根据 request_id 查询订单是否已创建
+func getResult(db *gorm.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		reqID := c.Param("request_id")
+		if reqID == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "msg": "request_id 必填"})
+			return
+		}
+
+		var order model.Order
+		err := db.Where("request_id = ?", reqID).First(&order).Error
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				// 还没写入，认为是排队中/处理中
+				c.JSON(http.StatusOK, gin.H{
+					"code": 0,
+					"data": gin.H{"status": "pending"},
+				})
+				return
+			}
 			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "msg": err.Error()})
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"order_no": orderNo}})
-
+		c.JSON(http.StatusOK, gin.H{
+			"code": 0,
+			"data": gin.H{
+				"status":     "created",
+				"order_no":   order.OrderNo,
+				"request_id": order.RequestID,
+			},
+		})
 	}
 }
