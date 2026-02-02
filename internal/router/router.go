@@ -1,20 +1,28 @@
 package router
 
 import (
+	"errors"
 	"flash_sale/internal/model"
+	"flash_sale/pkg/redis"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	rd "github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
 )
 
-func Setup(r *gin.Engine, db *gorm.DB) {
+func Setup(r *gin.Engine, db *gorm.DB, rdb *rd.Client) {
 	r.GET("ping", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"msg": "pong"})
 	})
+	// Products
 	r.GET("/api/products", listProducts(db))
 	r.POST("/api/products", createProduct(db))
+	// flash Sale
+	r.POST("/api/flash_sale/preload/:product_id", preloadStock(db, rdb))
+	r.GET("api/flash_sale/stock/:product_id", getStock(rdb))
 }
 
 func listProducts(db *gorm.DB) gin.HandlerFunc {
@@ -63,5 +71,55 @@ func createProduct(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"code": 0, "data": p})
+	}
+}
+
+func preloadStock(db *gorm.DB, rdb *rd.Client) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// get param from url
+		idStr := c.Param("product_id")
+		id, err := strconv.ParseUint(idStr, 10, 32)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "msg": "商品ID无效"})
+			return
+		}
+		var p model.Product
+		if err := db.First(&p, id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"code": 404, "msg": "商品不存在"})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "msg": err.Error()})
+			return
+		}
+		key := redis.StockKey(uint(id))
+		if err := rdb.Set(c.Request.Context(), key, p.Stock,24*time.Hour).Err(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "msg": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"code": 0, "msg": "预热成功"})
+	}
+}
+
+func getStock(rdb *rd.Client) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		idStr := c.Param("product_id")
+		// 32 bit 十进制
+		id, err := strconv.ParseUint(idStr, 10, 32)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "msg": "商品ID无效"})
+			return
+		}
+		key := redis.StockKey(uint(id))
+		val, err := rdb.Get(c.Request.Context(), key).Int64()
+		if err != nil {
+			if err == rd.Nil {
+				c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"stock": int64(0)}})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "msg": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"stock": val}})
 	}
 }
