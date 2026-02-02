@@ -19,7 +19,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("db open: %v", err)
 	}
-	if err := db.AutoMigrate(&model.Product{}); err != nil {
+	if err := db.AutoMigrate(&model.Product{}, &model.Order{}); err != nil {
 		log.Fatalf("db migrate: %v", err)
 	}
 

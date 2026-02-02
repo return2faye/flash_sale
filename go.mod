@@ -4,6 +4,7 @@ go 1.25.5
 
 require (
 	github.com/gin-gonic/gin v1.11.0
+	github.com/google/uuid v1.6.0
 	github.com/redis/go-redis/v9 v9.17.3
 	gorm.io/driver/sqlite v1.5.6
 	gorm.io/gorm v1.25.12
