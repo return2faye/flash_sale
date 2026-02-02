@@ -2,6 +2,7 @@ package router
 
 import (
 	"errors"
+	"flash_sale/internal/middleware"
 	"flash_sale/internal/model"
 	"flash_sale/pkg/redis"
 	"fmt"
@@ -29,7 +30,7 @@ end
 `
 
 func Setup(r *gin.Engine, db *gorm.DB, rdb *rd.Client) {
-	r.GET("ping", func(c *gin.Context) {
+	r.GET("/ping", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"msg": "pong"})
 	})
 	// Products
@@ -37,8 +38,8 @@ func Setup(r *gin.Engine, db *gorm.DB, rdb *rd.Client) {
 	r.POST("/api/products", createProduct(db))
 	// flash Sale
 	r.POST("/api/flash_sale/preload/:product_id", preloadStock(db, rdb))
-	r.GET("api/flash_sale/stock/:product_id", getStock(rdb))
-	r.POST("/api/flash_sale/buy", secKill(db, rdb))
+	r.GET("/api/flash_sale/stock/:product_id", getStock(rdb))
+	r.POST("/api/flash_sale/buy", middleware.RedisRateLimit(rdb, 1000, time.Second), secKill(db, rdb))
 }
 
 func listProducts(db *gorm.DB) gin.HandlerFunc {
