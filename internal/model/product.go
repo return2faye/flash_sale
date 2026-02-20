@@ -13,6 +13,7 @@ type Product struct {
 	UpdatedAt time.Time      `json:"updated_at"`
 	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
 
+	// Stock 表示初始库存（来源于 DB）；秒杀实时扣减走 Redis。
 	Name      string    `gorm:"size:128;not null" json:"name"`
 	Stock     int64     `gorm:"not null;default:0" json:"stock"`
 	SalePrice int64     `gorm:"not null" json:"sale_price"` // 单位：分

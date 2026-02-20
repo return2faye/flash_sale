@@ -13,12 +13,13 @@ type Order struct {
 	UpdatedAt time.Time      `json:"updated_at"`
 	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
 
-	OrderNo   string `gorm:"size:64;uniqueIndex;not null" json:"order_no"`
-	UserID    int64  `gorm:"not null;index" json:"user_id"`
-	ProductID uint   `gorm:"not null;index" json:"product_id"`
-	Quantity  int   `gorm:"not null;default:1" json:"quantity"`
-	Amount    int64 `gorm:"not null" json:"amount"` // 总金额，单位分
-	Status    int   `gorm:"not null;default:0" json:"status"` // 0 待支付 1 已支付 2 已取消
+	OrderNo string `gorm:"size:64;uniqueIndex;not null" json:"order_no"`
+	// (user_id, product_id) 唯一索引用于 DB 兜底一人一单。
+	UserID    int64  `gorm:"not null;index;uniqueIndex:idx_user_product,priority:1" json:"user_id"`
+	ProductID uint   `gorm:"not null;index;uniqueIndex:idx_user_product,priority:2" json:"product_id"`
+	Quantity  int    `gorm:"not null;default:1" json:"quantity"`
+	Amount    int64  `gorm:"not null" json:"amount"`           // 总金额，单位分
+	Status    int    `gorm:"not null;default:0" json:"status"` // 0 待支付 1 已支付 2 已取消
 	RequestID string `gorm:"size:64;uniqueIndex;not null" json:"request_id"`
 }
 

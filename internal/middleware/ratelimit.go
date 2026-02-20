@@ -12,6 +12,9 @@ import (
 	rd "github.com/redis/go-redis/v9"
 )
 
+// 该中间件用于购买接口的分布式限流。
+// 默认优先按 user_id 维度限流，解析失败则降级按 IP 限流。
+
 // luaRateLimit：Redis 滑动窗口限流 Lua 脚本（原子操作）
 // KEYS[1]=限流key，ARGV[1]=当前时间戳，ARGV[2]=窗口开始时间戳，ARGV[3]=窗口秒数
 // 返回：当前窗口内的请求数（如果 >= limit 则返回 -1 表示限流）
@@ -66,7 +69,7 @@ func RedisRateLimit(rdb *rd.Client, limit int, window time.Duration) gin.Handler
 			now, windowStart, windowSec, member, limit).Int()
 
 		if err != nil {
-			// Redis 出错时放行（降级策略）
+			// Redis 异常时选择放行：不让基础设施故障拖垮业务入口。
 			c.Next()
 			return
 		}

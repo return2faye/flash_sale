@@ -6,10 +6,11 @@ import (
 	"strconv"
 	"time"
 
+	"flash_sale/internal/config"
 	"flash_sale/internal/middleware"
 	"flash_sale/internal/model"
 	"flash_sale/internal/queue"
-	"flash_sale/pkg/redis"
+	rediskey "flash_sale/pkg/redis"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -30,7 +31,8 @@ else
 end
 `
 
-func Setup(r *gin.Engine, db *gorm.DB, rdb *rd.Client, producer *queue.Producer) {
+// Setup 注册全部 HTTP 路由。
+func Setup(r *gin.Engine, db *gorm.DB, rdb *rd.Client, producer *queue.Producer, cfg config.AppConfig) {
 	r.GET("/ping", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"msg": "pong"})
 	})
@@ -38,12 +40,13 @@ func Setup(r *gin.Engine, db *gorm.DB, rdb *rd.Client, producer *queue.Producer)
 	r.GET("/api/products", listProducts(db))
 	r.POST("/api/products", createProduct(db))
 	// flash Sale
-	r.POST("/api/flash_sale/preload/:product_id", preloadStock(db, rdb))
+	r.POST("/api/flash_sale/preload/:product_id", preloadStock(db, rdb, cfg.PreloadAdminToken, cfg.StockCacheTTL))
 	r.GET("/api/flash_sale/stock/:product_id", getStock(rdb))
-	r.POST("/api/flash_sale/buy", middleware.RedisRateLimit(rdb, 1000, time.Second), secKill(db, rdb, producer))
+	r.POST("/api/flash_sale/buy", middleware.RedisRateLimit(rdb, cfg.BuyRateLimit, cfg.BuyRateWindow), secKill(db, rdb, producer))
 	r.GET("/api/flash_sale/result/:request_id", getResult(db))
 }
 
+// listProducts 查询商品列表。
 func listProducts(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var list []model.Product
@@ -55,6 +58,7 @@ func listProducts(db *gorm.DB) gin.HandlerFunc {
 	}
 }
 
+// createProduct 创建秒杀商品（含时间窗校验）。
 func createProduct(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req struct {
@@ -78,6 +82,10 @@ func createProduct(db *gorm.DB) gin.HandlerFunc {
 			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "msg": "end_time 格式错误，请用 RFC3339"})
 			return
 		}
+		if !end.After(start) {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "msg": "end_time 必须晚于 start_time"})
+			return
+		}
 		p := &model.Product{
 			Name:      req.Name,
 			Stock:     req.Stock,
@@ -93,8 +101,15 @@ func createProduct(db *gorm.DB) gin.HandlerFunc {
 	}
 }
 
-func preloadStock(db *gorm.DB, rdb *rd.Client) gin.HandlerFunc {
+// preloadStock 将 DB 库存预热到 Redis，供高并发扣减。
+// 该接口要求简单管理员 token，避免被任意调用重置库存。
+func preloadStock(db *gorm.DB, rdb *rd.Client, adminToken string, ttl time.Duration) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if c.GetHeader("X-Admin-Token") != adminToken {
+			c.JSON(http.StatusUnauthorized, gin.H{"code": 401, "msg": "admin token 无效"})
+			return
+		}
+
 		// get param from url
 		idStr := c.Param("product_id")
 		id, err := strconv.ParseUint(idStr, 10, 32)
@@ -111,8 +126,8 @@ func preloadStock(db *gorm.DB, rdb *rd.Client) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "msg": err.Error()})
 			return
 		}
-		key := redis.StockKey(uint(id))
-		if err := rdb.Set(c.Request.Context(), key, p.Stock, 24*time.Hour).Err(); err != nil {
+		key := rediskey.StockKey(uint(id))
+		if err := rdb.Set(c.Request.Context(), key, p.Stock, ttl).Err(); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "msg": err.Error()})
 			return
 		}
@@ -120,6 +135,7 @@ func preloadStock(db *gorm.DB, rdb *rd.Client) gin.HandlerFunc {
 	}
 }
 
+// getStock 查询 Redis 中的实时库存。
 func getStock(rdb *rd.Client) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		idStr := c.Param("product_id")
@@ -129,7 +145,7 @@ func getStock(rdb *rd.Client) gin.HandlerFunc {
 			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "msg": "商品ID无效"})
 			return
 		}
-		key := redis.StockKey(uint(id))
+		key := rediskey.StockKey(uint(id))
 		val, err := rdb.Get(c.Request.Context(), key).Int64()
 		if err != nil {
 			if err == rd.Nil {
@@ -143,12 +159,19 @@ func getStock(rdb *rd.Client) gin.HandlerFunc {
 	}
 }
 
+// secKill 是秒杀下单入口。
+// 关键流程：
+// 1. 参数校验与活动时间校验
+// 2. 快速限购检查（pending/success）
+// 3. Redis Lua 原子扣减库存
+// 4. 写 order_requests(pending)
+// 5. 投递 Kafka 异步创建订单
 func secKill(db *gorm.DB, rdb *rd.Client, producer *queue.Producer) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req struct {
-			ProductID uint  `json:"product_id" binding:"required"`
-			UserID    int64 `json:"user_id" binding:"required"`
-			Quantity  int   `json:"quantity"`
+			ProductID uint  `json:"product_id" binding:"required,min=1"`
+			UserID    int64 `json:"user_id" binding:"required,min=1"`
+			Quantity  int   `json:"quantity" binding:"omitempty,min=1,max=1"`
 		}
 
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -158,6 +181,10 @@ func secKill(db *gorm.DB, rdb *rd.Client, producer *queue.Producer) gin.HandlerF
 
 		if req.Quantity <= 0 {
 			req.Quantity = 1
+		}
+		if req.Quantity != 1 {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "msg": "当前示例仅支持每次购买 1 件"})
+			return
 		}
 
 		var prod model.Product
@@ -176,9 +203,12 @@ func secKill(db *gorm.DB, rdb *rd.Client, producer *queue.Producer) gin.HandlerF
 			return
 		}
 
-		// 2. 是否已买过（一人一单）
-		var existOrder model.Order
-		err := db.Where("user_id = ? AND product_id = ? AND status != ?", req.UserID, req.ProductID, 2).Limit(1).First(&existOrder).Error
+		// 2. 应用层快速检查（一人一单 + 排队中的请求）
+		var existReq model.OrderRequest
+		err := db.Where("user_id = ? AND product_id = ? AND status IN ?", req.UserID, req.ProductID,
+			[]model.OrderRequestStatus{model.OrderRequestPending, model.OrderRequestSuccess}).
+			Limit(1).
+			First(&existReq).Error
 		if err == nil {
 			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "msg": "该商品已抢购过，限购一件"})
 			return
@@ -188,8 +218,11 @@ func secKill(db *gorm.DB, rdb *rd.Client, producer *queue.Producer) gin.HandlerF
 			return
 		}
 
+		// 生成 request_id 作为整条链路的追踪与幂等主键。
+		requestID := uuid.New().String()
+
 		// 3. Lua 原子扣减 Redis 库存
-		key := redis.StockKey(req.ProductID)
+		key := rediskey.StockKey(req.ProductID)
 		res, err := rdb.Eval(c.Request.Context(), luaDecrStock, []string{key}, req.Quantity).Int()
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "msg": err.Error()})
@@ -200,10 +233,24 @@ func secKill(db *gorm.DB, rdb *rd.Client, producer *queue.Producer) gin.HandlerF
 			return
 		}
 
-		// 4. 生成请求 ID，投递 Kafka，由后台异步写订单
-		requestID := uuid.New().String()
+		// 4. 落请求状态（pending）
 		amount := prod.SalePrice * int64(req.Quantity)
+		orderReq := &model.OrderRequest{
+			RequestID: requestID,
+			ProductID: req.ProductID,
+			UserID:    req.UserID,
+			Quantity:  req.Quantity,
+			Amount:    amount,
+			Status:    model.OrderRequestPending,
+		}
+		if err := db.Create(orderReq).Error; err != nil {
+			// 写状态失败时，立刻做一次幂等库存回补，避免“扣了库存却无请求状态”。
+			_, _ = rediskey.CompensateStockOnce(c.Request.Context(), rdb, requestID, req.ProductID, int64(req.Quantity))
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "msg": "create request failed: " + err.Error()})
+			return
+		}
 
+		// 5. 投递 Kafka，由后台异步写订单
 		msg := queue.OrderMessage{
 			RequestID: requestID,
 			ProductID: req.ProductID,
@@ -213,18 +260,31 @@ func secKill(db *gorm.DB, rdb *rd.Client, producer *queue.Producer) gin.HandlerF
 		}
 
 		if err := producer.Publish(c.Request.Context(), msg); err != nil {
-			// 投递失败：回滚 Redis 库存
-			_ = rdb.IncrBy(c.Request.Context(), key, int64(req.Quantity)).Err()
+			// 入队失败：状态改 failed + 回补库存（幂等回补，避免重复加库存）。
+			_ = db.Model(&model.OrderRequest{}).
+				Where("request_id = ?", requestID).
+				Updates(map[string]any{
+					"status":    model.OrderRequestFailed,
+					"error_msg": "enqueue_failed",
+				}).Error
+			_, _ = rediskey.CompensateStockOnce(c.Request.Context(), rdb, requestID, req.ProductID, int64(req.Quantity))
 			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "msg": "enqueue failed: " + err.Error()})
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{"request_id": requestID}})
+		// 这里不直接返回订单号，因为落单是异步的。
+		c.JSON(http.StatusOK, gin.H{
+			"code": 0,
+			"data": gin.H{
+				"request_id": requestID,
+				"status":     "pending",
+			},
+		})
 
 	}
 }
 
-// getResult 根据 request_id 查询订单是否已创建
+// getResult 根据 request_id 查询订单异步处理状态
 func getResult(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		reqID := c.Param("request_id")
@@ -233,28 +293,47 @@ func getResult(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		var order model.Order
-		err := db.Where("request_id = ?", reqID).First(&order).Error
+		var req model.OrderRequest
+		err := db.Where("request_id = ?", reqID).First(&req).Error
 		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				// 还没写入，认为是排队中/处理中
-				c.JSON(http.StatusOK, gin.H{
-					"code": 0,
-					"data": gin.H{"status": "pending"},
-				})
+				c.JSON(http.StatusNotFound, gin.H{"code": 404, "msg": "request_id 不存在"})
 				return
 			}
 			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "msg": err.Error()})
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{
-			"code": 0,
-			"data": gin.H{
-				"status":     "created",
-				"order_no":   order.OrderNo,
-				"request_id": order.RequestID,
-			},
-		})
+		// 将内部状态映射为前端可读语义。
+		switch req.Status {
+		case model.OrderRequestPending:
+			c.JSON(http.StatusOK, gin.H{
+				"code": 0,
+				"data": gin.H{
+					"status":     "pending",
+					"request_id": req.RequestID,
+				},
+			})
+		case model.OrderRequestSuccess:
+			c.JSON(http.StatusOK, gin.H{
+				"code": 0,
+				"data": gin.H{
+					"status":     "created",
+					"order_no":   req.OrderNo,
+					"request_id": req.RequestID,
+				},
+			})
+		case model.OrderRequestFailed:
+			c.JSON(http.StatusOK, gin.H{
+				"code": 0,
+				"data": gin.H{
+					"status":     "failed",
+					"request_id": req.RequestID,
+					"reason":     req.ErrorMsg,
+				},
+			})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "msg": "unknown request status"})
+		}
 	}
 }

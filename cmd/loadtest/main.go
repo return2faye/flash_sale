@@ -11,6 +11,7 @@ import (
 	"time"
 )
 
+// Result 记录单次请求的 HTTP 结果，便于聚合统计。
 type Result struct {
 	Status int
 	Body   string
@@ -21,6 +22,7 @@ func main() {
 	baseURL := flag.String("base", "http://localhost:8080", "server base url")
 	productID := flag.Int("product", 1, "product id")
 	preload := flag.Bool("preload", true, "call preload before test")
+	adminToken := flag.String("admin-token", "dev-admin-token", "admin token for preload endpoint")
 	stockCheck := flag.Bool("stock", true, "check redis stock after test")
 
 	// 超卖测试参数：200 个用户并发抢 1 件
@@ -31,7 +33,10 @@ func main() {
 	client := &http.Client{Timeout: 5 * time.Second}
 
 	if *preload {
-		if err := doPOST(client, fmt.Sprintf("%s/api/flash_sale/preload/%d", *baseURL, *productID), nil); err != nil {
+		// 先预热 Redis 库存，再发并发请求，避免库存 key 缺失导致测试偏差。
+		if err := doPOST(client, fmt.Sprintf("%s/api/flash_sale/preload/%d", *baseURL, *productID), nil, map[string]string{
+			"X-Admin-Token": *adminToken,
+		}); err != nil {
 			panic(fmt.Sprintf("preload failed: %v", err))
 		}
 		fmt.Println("preload ok")
@@ -129,6 +134,7 @@ func buyOnce(client *http.Client, baseURL string, req any) Result {
 	return Result{Status: resp.StatusCode, Body: string(body)}
 }
 
+// printSummary 聚合输出不同状态码分布。
 func printSummary(name string, results []Result) {
 	count := map[int]int{}
 	errCount := 0
@@ -150,7 +156,8 @@ func printSummary(name string, results []Result) {
 	}
 }
 
-func doPOST(client *http.Client, url string, body any) error {
+// doPOST 发送 POST 请求（支持附加请求头）。
+func doPOST(client *http.Client, url string, body any, headers map[string]string) error {
 	var r io.Reader
 	if body != nil {
 		b, _ := json.Marshal(body)
@@ -159,6 +166,9 @@ func doPOST(client *http.Client, url string, body any) error {
 	req, _ := http.NewRequest(http.MethodPost, url, r)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -172,6 +182,7 @@ func doPOST(client *http.Client, url string, body any) error {
 	return nil
 }
 
+// getStock 查询 Redis 中当前库存，用于压测后校验是否出现超卖。
 func getStock(client *http.Client, baseURL string, productID int) (int64, error) {
 	url := fmt.Sprintf("%s/api/flash_sale/stock/%d", baseURL, productID)
 	resp, err := client.Get(url)
