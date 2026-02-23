@@ -20,6 +20,7 @@ import (
 
 // errDuplicatePurchase 表示业务层的一人一单冲突。
 var errDuplicatePurchase = errors.New("duplicate purchase")
+var requestStateTTL = 24 * time.Hour
 
 // Consumer 负责消费 Kafka 下单消息并落库。
 // 依赖 DB（订单与状态）+ Redis（失败回补库存）。
@@ -87,8 +88,7 @@ func (c *Consumer) Run(ctx context.Context) {
 
 // processMessage 负责单条消息的业务流转：
 // - 消息校验
-// - 状态查找
-// - 建单并更新状态
+// - 建单并异步写请求状态
 // - 必要时失败回补库存
 func (c *Consumer) processMessage(ctx context.Context, m kafka.Message) error {
 	var msg OrderMessage
@@ -101,43 +101,43 @@ func (c *Consumer) processMessage(ctx context.Context, m kafka.Message) error {
 		return nil // poison message, skip
 	}
 
-	var req model.OrderRequest
-	err := c.db.Where("request_id = ?", msg.RequestID).First(&req).Error
+	orderNo, err := c.createOrderAndMarkSuccess(msg)
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			// 理论上不会发生（API 会先写 pending），兜底：标记失败并回补库存。
-			if err := c.createMissingFailedRequest(msg, "request_state_missing"); err != nil {
-				return err
-			}
-			return c.compensateStockOnce(ctx, msg)
-		}
-		return err
-	}
-
-	if req.Status == model.OrderRequestSuccess || req.Status == model.OrderRequestFailed {
-		return nil // already finalized, idempotent consume
-	}
-
-	if err := c.createOrderAndMarkSuccess(msg); err != nil {
 		if errors.Is(err, errDuplicatePurchase) {
-			if markErr := c.markRequestFailed(msg.RequestID, "duplicate_purchase"); markErr != nil {
+			if markErr := c.markRequestFailed(msg, "duplicate_purchase"); markErr != nil {
 				return markErr
+			}
+			if stateErr := rediskey.PutRequestState(ctx, c.rdb, msg.RequestID, rediskey.RequestFailed, "", "duplicate_purchase", requestStateTTL); stateErr != nil {
+				log.Printf("consumer sync redis failed state request_id=%s: %v", msg.RequestID, stateErr)
 			}
 			return c.compensateStockOnce(ctx, msg)
 		}
 		if errorsLikeUnique(err) {
 			// Duplicate by request_id, sync state then continue.
-			return c.syncRequestStatusFromOrder(msg.RequestID)
+			_, syncErr := c.syncRequestStatusFromOrder(ctx, msg.RequestID)
+			return syncErr
 		}
 		return err
+	}
+
+	if orderNo != "" {
+		if err := rediskey.PutRequestState(ctx, c.rdb, msg.RequestID, rediskey.RequestSuccess, orderNo, "", requestStateTTL); err != nil {
+			log.Printf("consumer sync redis success state request_id=%s: %v", msg.RequestID, err)
+		}
 	}
 	return nil
 }
 
 // createOrderAndMarkSuccess 在事务里做“建单 + 状态更新”。
 // 事务目标：保证订单写入与请求状态的原子一致。
-func (c *Consumer) createOrderAndMarkSuccess(msg OrderMessage) error {
-	return c.db.Transaction(func(tx *gorm.DB) error {
+func (c *Consumer) createOrderAndMarkSuccess(msg OrderMessage) (string, error) {
+	var resultOrderNo string
+
+	err := c.db.Transaction(func(tx *gorm.DB) error {
+		if err := upsertPendingRequest(tx, msg); err != nil {
+			return err
+		}
+
 		var req model.OrderRequest
 		// 行级锁住 request_id 对应记录，避免并发消费者竞态（即使概率低，也显式防护）。
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -146,7 +146,17 @@ func (c *Consumer) createOrderAndMarkSuccess(msg OrderMessage) error {
 			return err
 		}
 
-		if req.Status == model.OrderRequestSuccess || req.Status == model.OrderRequestFailed {
+		if req.Status == model.OrderRequestSuccess {
+			resultOrderNo = req.OrderNo
+			if resultOrderNo == "" {
+				var exist model.Order
+				if e := tx.Where("request_id = ?", msg.RequestID).First(&exist).Error; e == nil {
+					resultOrderNo = exist.OrderNo
+				}
+			}
+			return nil
+		}
+		if req.Status == model.OrderRequestFailed {
 			return nil
 		}
 
@@ -166,8 +176,9 @@ func (c *Consumer) createOrderAndMarkSuccess(msg OrderMessage) error {
 				// request_id 唯一冲突：幂等消费，直接同步为成功。
 				var exist model.Order
 				if e := tx.Where("request_id = ?", msg.RequestID).First(&exist).Error; e == nil {
+					resultOrderNo = exist.OrderNo
 					res := tx.Model(&model.OrderRequest{}).
-						Where("request_id = ? AND status = ?", msg.RequestID, model.OrderRequestPending).
+						Where("request_id = ?", msg.RequestID).
 						Updates(map[string]any{
 							"status":    model.OrderRequestSuccess,
 							"order_no":  exist.OrderNo,
@@ -187,59 +198,74 @@ func (c *Consumer) createOrderAndMarkSuccess(msg OrderMessage) error {
 			return err
 		}
 
+		resultOrderNo = orderNo
 		return tx.Model(&model.OrderRequest{}).
-			Where("request_id = ? AND status = ?", msg.RequestID, model.OrderRequestPending).
+			Where("request_id = ?", msg.RequestID).
 			Updates(map[string]any{
 				"status":    model.OrderRequestSuccess,
 				"order_no":  orderNo,
 				"error_msg": "",
 			}).Error
 	})
+	if err != nil {
+		return "", err
+	}
+	return resultOrderNo, nil
 }
 
-// createMissingFailedRequest 用于补偿场景：请求状态缺失时补一条 failed 记录。
-func (c *Consumer) createMissingFailedRequest(msg OrderMessage, reason string) error {
+func upsertPendingRequest(tx *gorm.DB, msg OrderMessage) error {
 	row := &model.OrderRequest{
 		RequestID: msg.RequestID,
 		UserID:    msg.UserID,
 		ProductID: msg.ProductID,
 		Quantity:  msg.Quantity,
 		Amount:    msg.Amount,
-		Status:    model.OrderRequestFailed,
-		ErrorMsg:  reason,
+		Status:    model.OrderRequestPending,
 	}
-	return c.db.Clauses(clause.OnConflict{
+	return tx.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "request_id"}},
 		DoNothing: true,
 	}).Create(row).Error
 }
 
 // markRequestFailed 仅允许 pending -> failed，防止覆盖终态。
-func (c *Consumer) markRequestFailed(requestID, reason string) error {
-	return c.db.Model(&model.OrderRequest{}).
-		Where("request_id = ? AND status = ?", requestID, model.OrderRequestPending).
-		Updates(map[string]any{
-			"status":    model.OrderRequestFailed,
-			"error_msg": reason,
-		}).Error
+func (c *Consumer) markRequestFailed(msg OrderMessage, reason string) error {
+	return c.db.Transaction(func(tx *gorm.DB) error {
+		if err := upsertPendingRequest(tx, msg); err != nil {
+			return err
+		}
+		return tx.Model(&model.OrderRequest{}).
+			Where("request_id = ? AND status = ?", msg.RequestID, model.OrderRequestPending).
+			Updates(map[string]any{
+				"status":    model.OrderRequestFailed,
+				"error_msg": reason,
+			}).Error
+	})
 }
 
 // syncRequestStatusFromOrder 在幂等场景下，用已有订单反推请求状态为 success。
-func (c *Consumer) syncRequestStatusFromOrder(requestID string) error {
+func (c *Consumer) syncRequestStatusFromOrder(ctx context.Context, requestID string) (string, error) {
 	var order model.Order
 	if err := c.db.Where("request_id = ?", requestID).First(&order).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil
+			return "", nil
 		}
-		return err
+		return "", err
 	}
-	return c.db.Model(&model.OrderRequest{}).
+
+	if err := c.db.Model(&model.OrderRequest{}).
 		Where("request_id = ?", requestID).
 		Updates(map[string]any{
 			"status":    model.OrderRequestSuccess,
 			"order_no":  order.OrderNo,
 			"error_msg": "",
-		}).Error
+		}).Error; err != nil {
+		return "", err
+	}
+	if err := rediskey.PutRequestState(ctx, c.rdb, requestID, rediskey.RequestSuccess, order.OrderNo, "", requestStateTTL); err != nil {
+		log.Printf("consumer sync redis success state request_id=%s: %v", requestID, err)
+	}
+	return order.OrderNo, nil
 }
 
 // compensateStockOnce 失败时回补库存（按 request_id 最多回补一次）。

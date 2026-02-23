@@ -21,6 +21,11 @@ type AppConfig struct {
 	KafkaTopic   string
 	KafkaGroupID string
 
+	// Redis Stream outbox（API 原子入流，Relay 异步转 Kafka）
+	OrderEventStream   string
+	OrderEventGroup    string
+	OrderEventConsumer string
+
 	// 购买接口限流与库存缓存策略
 	BuyRateLimit  int
 	BuyRateWindow time.Duration
@@ -33,17 +38,20 @@ type AppConfig struct {
 // Load 读取并校验配置，缺失时使用默认值。
 func Load() (AppConfig, error) {
 	cfg := AppConfig{
-		HTTPAddr:          getEnv("HTTP_ADDR", ":8080"),
-		DBPath:            getEnv("DB_PATH", "flash_sale.db"),
-		RedisAddr:         getEnv("REDIS_ADDR", "localhost:6379"),
-		RedisDB:           0,
-		KafkaBrokers:      splitCSV(getEnv("KAFKA_BROKERS", "localhost:9092")),
-		KafkaTopic:        getEnv("KAFKA_TOPIC", "flash-sale-orders"),
-		KafkaGroupID:      getEnv("KAFKA_GROUP_ID", "flash-sale-order-consumer"),
-		BuyRateLimit:      1000,
-		BuyRateWindow:     time.Second,
-		StockCacheTTL:     24 * time.Hour,
-		PreloadAdminToken: getEnv("PRELOAD_ADMIN_TOKEN", "dev-admin-token"),
+		HTTPAddr:           getEnv("HTTP_ADDR", ":8080"),
+		DBPath:             getEnv("DB_PATH", "flash_sale.db"),
+		RedisAddr:          getEnv("REDIS_ADDR", "localhost:6379"),
+		RedisDB:            0,
+		KafkaBrokers:       splitCSV(getEnv("KAFKA_BROKERS", "localhost:9092")),
+		KafkaTopic:         getEnv("KAFKA_TOPIC", "flash-sale-orders"),
+		KafkaGroupID:       getEnv("KAFKA_GROUP_ID", "flash-sale-order-consumer"),
+		OrderEventStream:   getEnv("ORDER_EVENT_STREAM", "flash_sale:order_events"),
+		OrderEventGroup:    getEnv("ORDER_EVENT_GROUP", "flash-sale-relay-group"),
+		OrderEventConsumer: getEnv("ORDER_EVENT_CONSUMER", "flash-sale-relay-1"),
+		BuyRateLimit:       1000,
+		BuyRateWindow:      time.Second,
+		StockCacheTTL:      24 * time.Hour,
+		PreloadAdminToken:  getEnv("PRELOAD_ADMIN_TOKEN", "dev-admin-token"),
 	}
 
 	redisDB, err := getEnvInt("REDIS_DB", cfg.RedisDB)
@@ -87,6 +95,15 @@ func Load() (AppConfig, error) {
 	}
 	if cfg.KafkaGroupID == "" {
 		return AppConfig{}, fmt.Errorf("KAFKA_GROUP_ID must not be empty")
+	}
+	if cfg.OrderEventStream == "" {
+		return AppConfig{}, fmt.Errorf("ORDER_EVENT_STREAM must not be empty")
+	}
+	if cfg.OrderEventGroup == "" {
+		return AppConfig{}, fmt.Errorf("ORDER_EVENT_GROUP must not be empty")
+	}
+	if cfg.OrderEventConsumer == "" {
+		return AppConfig{}, fmt.Errorf("ORDER_EVENT_CONSUMER must not be empty")
 	}
 
 	return cfg, nil

@@ -21,7 +21,7 @@ import (
 )
 
 // main 负责初始化依赖并启动 HTTP 服务。
-// 启动顺序：配置 -> DB -> Redis -> Kafka Producer/Consumer -> Router -> HTTP Server。
+// 启动顺序：配置 -> DB -> Redis -> Producer/Relay/Consumer -> Router -> HTTP Server。
 func main() {
 	// 1) 加载配置（支持环境变量覆盖默认值）
 	cfg, err := config.Load()
@@ -52,20 +52,23 @@ func main() {
 		log.Fatalf("redis: %v", err)
 	}
 
-	// 4) 初始化 Kafka 生产者与消费者
+	// 4) 初始化 Kafka 生产者、Relay 与消费者
 	producer := queue.NewProducer(cfg.KafkaBrokers, cfg.KafkaTopic)
 	defer producer.Close()
+
+	relay := queue.NewRelay(rdb, producer, cfg.OrderEventStream, cfg.OrderEventGroup, cfg.OrderEventConsumer)
 
 	consumer := queue.NewConsumer(cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaGroupID, db, rdb)
 	defer consumer.Close()
 
 	consumerCtx, cancelConsumer := context.WithCancel(context.Background())
 	defer cancelConsumer()
+	go relay.Run(consumerCtx)
 	go consumer.Run(consumerCtx)
 
 	// 5) 初始化路由并交给 HTTP Server
 	r := gin.Default()
-	router.Setup(r, db, rdb, producer, cfg)
+	router.Setup(r, db, rdb, cfg)
 
 	srv := &http.Server{
 		Addr:    cfg.HTTPAddr,
@@ -75,7 +78,7 @@ func main() {
 	appCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// 6) 收到退出信号后，先停 consumer，再优雅关闭 HTTP 服务
+	// 6) 收到退出信号后，先停 worker（relay/consumer），再优雅关闭 HTTP 服务
 	go func() {
 		<-appCtx.Done()
 		cancelConsumer()

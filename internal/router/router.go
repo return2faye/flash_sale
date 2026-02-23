@@ -1,15 +1,16 @@
 package router
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"flash_sale/internal/config"
 	"flash_sale/internal/middleware"
 	"flash_sale/internal/model"
-	"flash_sale/internal/queue"
 	rediskey "flash_sale/pkg/redis"
 
 	"github.com/gin-gonic/gin"
@@ -18,21 +19,68 @@ import (
 	"gorm.io/gorm"
 )
 
-// luaDecrStock：Redis 内原子「读库存 → 判断 ≥ 扣减量 → DECRBY」
-// KEYS[1]=库存key，ARGV[1]=扣减数量；返回扣减后的值，不足则返回 -1
-const luaDecrStock = `
-local key = KEYS[1]
-local decr = tonumber(ARGV[1])
-local current = tonumber(redis.call('GET', key) or '0')
-if current >= decr then
-  return redis.call('DECRBY', key, decr)
-else
-  return -1
+// luaReserveRequest 原子完成：
+// 1) 幂等键命中直接返回历史 request_id
+// 2) 一人一单锁校验
+// 3) 库存校验与扣减
+// 4) 写 request 状态 pending
+// 5) 写用户锁与幂等映射
+const luaReserveRequest = `
+local stockKey = KEYS[1]
+local userLockKey = KEYS[2]
+local requestStateKey = KEYS[3]
+local idemKey = KEYS[4]
+local streamKey = KEYS[5]
+
+local quantity = tonumber(ARGV[1])
+local requestID = ARGV[2]
+local userID = ARGV[3]
+local productID = ARGV[4]
+local amount = ARGV[5]
+local requestTTL = tonumber(ARGV[6])
+local userLockTTL = tonumber(ARGV[7])
+local idemTTL = tonumber(ARGV[8])
+
+local existingReq = redis.call('GET', idemKey)
+if existingReq then
+  return 'IDEMPOTENT:' .. existingReq
 end
+
+if redis.call('EXISTS', userLockKey) == 1 then
+  return 'DUPLICATE'
+end
+
+local current = tonumber(redis.call('GET', stockKey) or '0')
+if current < quantity then
+  return 'OUT_OF_STOCK'
+end
+
+redis.call('DECRBY', stockKey, quantity)
+redis.call('SET', userLockKey, requestID, 'EX', userLockTTL)
+redis.call('SET', idemKey, requestID, 'EX', idemTTL)
+redis.call('HSET', requestStateKey,
+  'request_id', requestID,
+  'status', 'pending',
+  'order_no', '',
+  'reason', '',
+  'user_id', userID,
+  'product_id', productID,
+  'quantity', quantity,
+  'amount', amount
+)
+redis.call('EXPIRE', requestStateKey, requestTTL)
+redis.call('XADD', streamKey, '*',
+  'request_id', requestID,
+  'product_id', productID,
+  'user_id', userID,
+  'quantity', quantity,
+  'amount', amount
+)
+return 'OK'
 `
 
 // Setup 注册全部 HTTP 路由。
-func Setup(r *gin.Engine, db *gorm.DB, rdb *rd.Client, producer *queue.Producer, cfg config.AppConfig) {
+func Setup(r *gin.Engine, db *gorm.DB, rdb *rd.Client, cfg config.AppConfig) {
 	r.GET("/ping", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"msg": "pong"})
 	})
@@ -42,8 +90,8 @@ func Setup(r *gin.Engine, db *gorm.DB, rdb *rd.Client, producer *queue.Producer,
 	// flash Sale
 	r.POST("/api/flash_sale/preload/:product_id", preloadStock(db, rdb, cfg.PreloadAdminToken, cfg.StockCacheTTL))
 	r.GET("/api/flash_sale/stock/:product_id", getStock(rdb))
-	r.POST("/api/flash_sale/buy", middleware.RedisRateLimit(rdb, cfg.BuyRateLimit, cfg.BuyRateWindow), secKill(db, rdb, producer))
-	r.GET("/api/flash_sale/result/:request_id", getResult(db))
+	r.POST("/api/flash_sale/buy", middleware.RedisRateLimit(rdb, cfg.BuyRateLimit, cfg.BuyRateWindow), secKill(db, rdb, cfg.StockCacheTTL, cfg.OrderEventStream))
+	r.GET("/api/flash_sale/result/:request_id", getResult(db, rdb))
 }
 
 // listProducts 查询商品列表。
@@ -162,11 +210,9 @@ func getStock(rdb *rd.Client) gin.HandlerFunc {
 // secKill 是秒杀下单入口。
 // 关键流程：
 // 1. 参数校验与活动时间校验
-// 2. 快速限购检查（pending/success）
-// 3. Redis Lua 原子扣减库存
-// 4. 写 order_requests(pending)
-// 5. 投递 Kafka 异步创建订单
-func secKill(db *gorm.DB, rdb *rd.Client, producer *queue.Producer) gin.HandlerFunc {
+// 2. Redis Lua 原子接入（幂等 + 一人一单 + 扣库存 + pending 状态 + outbox 入流）
+// 3. API 直接返回 pending，由 Relay 异步转发 Kafka
+func secKill(db *gorm.DB, rdb *rd.Client, requestStateTTL time.Duration, orderEventStream string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req struct {
 			ProductID uint  `json:"product_id" binding:"required,min=1"`
@@ -203,76 +249,71 @@ func secKill(db *gorm.DB, rdb *rd.Client, producer *queue.Producer) gin.HandlerF
 			return
 		}
 
-		// 2. 应用层快速检查（一人一单 + 排队中的请求）
-		var existReq model.OrderRequest
-		err := db.Where("user_id = ? AND product_id = ? AND status IN ?", req.UserID, req.ProductID,
-			[]model.OrderRequestStatus{model.OrderRequestPending, model.OrderRequestSuccess}).
-			Limit(1).
-			First(&existReq).Error
-		if err == nil {
-			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "msg": "该商品已抢购过，限购一件"})
-			return
-		}
-		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "msg": err.Error()})
-			return
-		}
-
-		// 生成 request_id 作为整条链路的追踪与幂等主键。
 		requestID := uuid.New().String()
+		idemToken := strings.TrimSpace(c.GetHeader("X-Idempotency-Key"))
+		if idemToken == "" {
+			idemToken = "auto-" + requestID
+		}
 
-		// 3. Lua 原子扣减 Redis 库存
-		key := rediskey.StockKey(req.ProductID)
-		res, err := rdb.Eval(c.Request.Context(), luaDecrStock, []string{key}, req.Quantity).Int()
+		amount := prod.SalePrice * int64(req.Quantity)
+		statusTTL := requestStateTTL
+		if statusTTL <= 0 {
+			statusTTL = 24 * time.Hour
+		}
+		lockTTL := time.Until(prod.EndTime) + time.Hour
+		if lockTTL < time.Hour {
+			lockTTL = 24 * time.Hour
+		}
+
+		stockKey := rediskey.StockKey(req.ProductID)
+		userLockKey := rediskey.UserPurchaseLockKey(req.ProductID, req.UserID)
+		requestStateKey := rediskey.RequestStatusKey(requestID)
+		idemKey := rediskey.RequestIdempotencyKey(req.ProductID, req.UserID, idemToken)
+
+		res, err := rdb.Eval(c.Request.Context(), luaReserveRequest,
+			[]string{stockKey, userLockKey, requestStateKey, idemKey, orderEventStream},
+			req.Quantity, requestID, req.UserID, req.ProductID, amount,
+			int64(statusTTL/time.Second), int64(lockTTL/time.Second), int64(statusTTL/time.Second),
+		).Text()
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "msg": err.Error()})
 			return
 		}
-		if res < 0 {
+
+		switch {
+		case res == "OUT_OF_STOCK":
 			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "msg": "库存不足"})
 			return
-		}
-
-		// 4. 落请求状态（pending）
-		amount := prod.SalePrice * int64(req.Quantity)
-		orderReq := &model.OrderRequest{
-			RequestID: requestID,
-			ProductID: req.ProductID,
-			UserID:    req.UserID,
-			Quantity:  req.Quantity,
-			Amount:    amount,
-			Status:    model.OrderRequestPending,
-		}
-		if err := db.Create(orderReq).Error; err != nil {
-			// 写状态失败时，立刻做一次幂等库存回补，避免“扣了库存却无请求状态”。
-			_, _ = rediskey.CompensateStockOnce(c.Request.Context(), rdb, requestID, req.ProductID, int64(req.Quantity))
-			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "msg": "create request failed: " + err.Error()})
+		case res == "DUPLICATE":
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "msg": "该商品已抢购过，限购一件"})
+			return
+		case strings.HasPrefix(res, "IDEMPOTENT:"):
+			existReqID := strings.TrimPrefix(res, "IDEMPOTENT:")
+			state, found, err := loadRequestState(c.Request.Context(), db, rdb, existReqID, statusTTL)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "msg": err.Error()})
+				return
+			}
+			if !found {
+				c.JSON(http.StatusOK, gin.H{
+					"code": 0,
+					"data": gin.H{
+						"request_id": existReqID,
+						"status":     "pending",
+					},
+				})
+				return
+			}
+			respondWithState(c, state)
 			return
 		}
 
-		// 5. 投递 Kafka，由后台异步写订单
-		msg := queue.OrderMessage{
-			RequestID: requestID,
-			ProductID: req.ProductID,
-			UserID:    req.UserID,
-			Quantity:  req.Quantity,
-			Amount:    amount,
-		}
-
-		if err := producer.Publish(c.Request.Context(), msg); err != nil {
-			// 入队失败：状态改 failed + 回补库存（幂等回补，避免重复加库存）。
-			_ = db.Model(&model.OrderRequest{}).
-				Where("request_id = ?", requestID).
-				Updates(map[string]any{
-					"status":    model.OrderRequestFailed,
-					"error_msg": "enqueue_failed",
-				}).Error
-			_, _ = rediskey.CompensateStockOnce(c.Request.Context(), rdb, requestID, req.ProductID, int64(req.Quantity))
-			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "msg": "enqueue failed: " + err.Error()})
+		if res != "OK" {
+			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "msg": "reserve stock failed"})
 			return
 		}
 
-		// 这里不直接返回订单号，因为落单是异步的。
+		// 异步建单：事件已写入 Redis Stream，后续由 Relay 转 Kafka。
 		c.JSON(http.StatusOK, gin.H{
 			"code": 0,
 			"data": gin.H{
@@ -285,7 +326,7 @@ func secKill(db *gorm.DB, rdb *rd.Client, producer *queue.Producer) gin.HandlerF
 }
 
 // getResult 根据 request_id 查询订单异步处理状态
-func getResult(db *gorm.DB) gin.HandlerFunc {
+func getResult(db *gorm.DB, rdb *rd.Client) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		reqID := c.Param("request_id")
 		if reqID == "" {
@@ -293,47 +334,85 @@ func getResult(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		var req model.OrderRequest
-		err := db.Where("request_id = ?", reqID).First(&req).Error
+		state, found, err := loadRequestState(c.Request.Context(), db, rdb, reqID, 24*time.Hour)
 		if err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				c.JSON(http.StatusNotFound, gin.H{"code": 404, "msg": "request_id 不存在"})
-				return
-			}
 			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "msg": err.Error()})
 			return
 		}
-
-		// 将内部状态映射为前端可读语义。
-		switch req.Status {
-		case model.OrderRequestPending:
-			c.JSON(http.StatusOK, gin.H{
-				"code": 0,
-				"data": gin.H{
-					"status":     "pending",
-					"request_id": req.RequestID,
-				},
-			})
-		case model.OrderRequestSuccess:
-			c.JSON(http.StatusOK, gin.H{
-				"code": 0,
-				"data": gin.H{
-					"status":     "created",
-					"order_no":   req.OrderNo,
-					"request_id": req.RequestID,
-				},
-			})
-		case model.OrderRequestFailed:
-			c.JSON(http.StatusOK, gin.H{
-				"code": 0,
-				"data": gin.H{
-					"status":     "failed",
-					"request_id": req.RequestID,
-					"reason":     req.ErrorMsg,
-				},
-			})
-		default:
-			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "msg": "unknown request status"})
+		if !found {
+			c.JSON(http.StatusNotFound, gin.H{"code": 404, "msg": "request_id 不存在"})
+			return
 		}
+		respondWithState(c, state)
+	}
+}
+
+func loadRequestState(ctx context.Context, db *gorm.DB, rdb *rd.Client, requestID string, ttl time.Duration) (rediskey.RequestState, bool, error) {
+	state, found, err := rediskey.GetRequestState(ctx, rdb, requestID)
+	if err != nil {
+		return rediskey.RequestState{}, false, err
+	}
+	if found {
+		return state, true, nil
+	}
+
+	var req model.OrderRequest
+	if err := db.Where("request_id = ?", requestID).First(&req).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return rediskey.RequestState{}, false, nil
+		}
+		return rediskey.RequestState{}, false, err
+	}
+
+	out := rediskey.RequestState{
+		RequestID: req.RequestID,
+	}
+	switch req.Status {
+	case model.OrderRequestPending:
+		out.Status = rediskey.RequestPending
+	case model.OrderRequestSuccess:
+		out.Status = rediskey.RequestSuccess
+		out.OrderNo = req.OrderNo
+	case model.OrderRequestFailed:
+		out.Status = rediskey.RequestFailed
+		out.Reason = req.ErrorMsg
+	default:
+		out.Status = rediskey.RequestPending
+	}
+
+	_ = rediskey.PutRequestState(ctx, rdb, out.RequestID, out.Status, out.OrderNo, out.Reason, ttl)
+	return out, true, nil
+}
+
+func respondWithState(c *gin.Context, state rediskey.RequestState) {
+	switch state.Status {
+	case rediskey.RequestPending:
+		c.JSON(http.StatusOK, gin.H{
+			"code": 0,
+			"data": gin.H{
+				"status":     "pending",
+				"request_id": state.RequestID,
+			},
+		})
+	case rediskey.RequestSuccess:
+		c.JSON(http.StatusOK, gin.H{
+			"code": 0,
+			"data": gin.H{
+				"status":     "created",
+				"order_no":   state.OrderNo,
+				"request_id": state.RequestID,
+			},
+		})
+	case rediskey.RequestFailed:
+		c.JSON(http.StatusOK, gin.H{
+			"code": 0,
+			"data": gin.H{
+				"status":     "failed",
+				"request_id": state.RequestID,
+				"reason":     state.Reason,
+			},
+		})
+	default:
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "msg": "unknown request status"})
 	}
 }
